@@ -59,7 +59,9 @@
     while (!disposed && active < 4 && queue.length) {
       const current = Number(new URLSearchParams(location.hash.slice(1)).get('view')) || 0;
       const visible = new Set((spreads[current] || []).map(n => `page:${String(n).padStart(3, '0')}`));
-      const urgent = queue.findIndex(job => visible.has(job.id));
+      const zooming = document.querySelector('#zoom-dialog[open]');
+      const zoomJob = zooming ? queue.findIndex(job => job.id.startsWith('zoom:')) : -1;
+      const urgent = zoomJob >= 0 ? zoomJob : queue.findIndex(job => visible.has(job.id));
       if (urgent > 0) queue.unshift(queue.splice(urgent, 1)[0]);
       const job = queue.shift();
       active++;
@@ -143,13 +145,15 @@
     if (!Number.isFinite(expiresAt)) throw new Error('Invalid expiry');
     if (Date.now() >= expiresAt) { locked('作品集已到期', '当前链接已停止显示，请联系作品集所有者。'); return; }
 
-    function imageBlob(n, thumb) {
-      const id = `${thumb ? 'thumb' : 'page'}:${String(n).padStart(3, '0')}`;
+    function imageBlob(n, kind) {
+      const id = `${kind}:${String(n).padStart(3, '0')}`;
       if (!images.has(id)) {
         const record = manifest.images[id];
         if (!record) return Promise.reject(new Error('Unknown image'));
         const promise = enqueue(async () => {
-          const data = await fetchBytes(record.path, true, bytes => decrypt(bytes, id));
+          const label = record.aadLabel || id;
+          if (label !== id && !(kind === 'zoom' && label === id.replace('zoom:', 'page:'))) throw new Error('Invalid image label');
+          const data = await fetchBytes(record.path, true, bytes => decrypt(bytes, label));
           if (disposed) throw new Error('Reader closed');
           const url = URL.createObjectURL(new Blob([data], { type: 'image/webp' }));
           blobURLs.add(url);
@@ -163,9 +167,10 @@
 
     function loadImage(img, n, thumb = false) {
       if (disposed) return;
+      const kind = thumb === 'zoom' ? 'zoom' : thumb ? 'thumb' : 'page';
       img.dataset.privatePage = String(n);
-      img.dataset.privateKind = thumb ? 'thumb' : 'page';
-      const matching = () => document.querySelectorAll(`img[data-private-page="${n}"][data-private-kind="${thumb ? 'thumb' : 'page'}"]`);
+      img.dataset.privateKind = kind;
+      const matching = () => document.querySelectorAll(`img[data-private-page="${n}"][data-private-kind="${kind}"]`);
       let attempts = 0;
       const load = () => {
         attempts++;
@@ -174,7 +179,7 @@
           const status = target.parentElement.querySelector('.reader-image-status');
           if (status) status.textContent = '正在加载…';
         }
-        return imageBlob(n, thumb).then(url => {
+        return imageBlob(n, kind).then(url => {
           if (disposed) return;
           // PageFlip clones a page during a turn; update that copy as well.
           for (const target of matching()) {
