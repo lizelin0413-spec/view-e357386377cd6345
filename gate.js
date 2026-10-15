@@ -9,6 +9,12 @@
   const pending = new WeakMap();
   const queue = [];
   const controller = new AbortController();
+  const manifestPath = document.querySelector('meta[name="reader-manifest"]')?.content;
+  const manifestHash = document.querySelector('meta[name="reader-manifest-sha256"]')?.content;
+  const mirrorBase = document.querySelector('meta[name="reader-mirror"]')?.content || '';
+  const mirrorAllowed = /^https:\/\/cdn\.jsdelivr\.net\/gh\/lizelin0413-spec\/view-e357386377cd6345@[a-f0-9]{40}\/$/.test(mirrorBase);
+  const retryTimers = new Set();
+  let spreads = [];
   let active = 0;
   let disposed = false;
   let expiresAt = Infinity;
@@ -40,6 +46,8 @@
     disposed = true;
     clearTimeout(deadlineTimer);
     controller.abort();
+    for (const timer of retryTimers) clearTimeout(timer);
+    retryTimers.clear();
     queue.length = 0;
     lazyObserver.disconnect();
     for (const url of blobURLs) URL.revokeObjectURL(url);
@@ -49,14 +57,18 @@
 
   function pump() {
     while (!disposed && active < 4 && queue.length) {
+      const current = Number(new URLSearchParams(location.hash.slice(1)).get('view')) || 0;
+      const visible = new Set((spreads[current] || []).map(n => `page:${String(n).padStart(3, '0')}`));
+      const urgent = queue.findIndex(job => visible.has(job.id));
+      if (urgent > 0) queue.unshift(queue.splice(urgent, 1)[0]);
       const job = queue.shift();
       active++;
       job.run().then(job.resolve, job.reject).finally(() => { active--; pump(); });
     }
   }
 
-  function enqueue(run) {
-    return new Promise((resolve, reject) => { queue.push({ run, resolve, reject }); pump(); });
+  function enqueue(run, id) {
+    return new Promise((resolve, reject) => { queue.push({ run, resolve, reject, id }); pump(); });
   }
 
   const lazyObserver = new IntersectionObserver(entries => {
@@ -69,12 +81,36 @@
     }
   }, { rootMargin: '700px' });
 
-  async function fetchBytes(path, immutable = false) {
-    const response = await fetch(new URL(path, location.href), {
-      cache: immutable ? 'force-cache' : 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer', signal: controller.signal
-    });
-    if (!response.ok) throw new Error('Resource unavailable');
-    return new Uint8Array(await response.arrayBuffer());
+  async function fetchBytes(path, immutable = false, validate = bytes => bytes) {
+    const routes = [new URL(path, location.href).href];
+    if (mirrorAllowed && /^\.\/vault\/[a-f0-9]{32}\.bin$/.test(path)) routes.push(new URL(path, mirrorBase).href);
+    const group = new AbortController();
+    const cancel = () => group.abort();
+    controller.signal.addEventListener('abort', cancel, { once: true });
+    if (controller.signal.aborted) group.abort();
+    let startBackup;
+    const backupReady = new Promise(resolve => { startBackup = resolve; });
+    const hedgeTimer = setTimeout(() => startBackup(), 900);
+    async function attempt(url, index) {
+      if (index) await backupReady;
+      if (group.signal.aborted) throw new Error('Request cancelled');
+      const route = new AbortController();
+      const cancelRoute = () => route.abort();
+      group.signal.addEventListener('abort', cancelRoute, { once: true });
+      if (group.signal.aborted) route.abort();
+      const timer = setTimeout(cancelRoute, 15000);
+      try {
+        const response = await fetch(url, {
+          cache: immutable ? 'force-cache' : 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer', signal: route.signal
+        });
+        if (!response.ok) throw new Error('Resource unavailable');
+        // Keep the deadline active through the body read and integrity check.
+        return await validate(new Uint8Array(await response.arrayBuffer()));
+      } catch (error) { if (!index) startBackup(); throw error; }
+      finally { clearTimeout(timer); group.signal.removeEventListener('abort', cancelRoute); }
+    }
+    try { return await Promise.any(routes.map(attempt)); }
+    finally { clearTimeout(hedgeTimer); group.abort(); startBackup(); controller.signal.removeEventListener('abort', cancel); }
   }
 
   async function start() {
@@ -91,11 +127,18 @@
         name: 'AES-GCM', iv: bytes.subarray(0, 12), additionalData: encoder.encode(`${protocol}:${label}`), tagLength: 128
       }, key, bytes.subarray(12));
     }
-    const descriptor = await fetchBytes('./link.json');
-    const publicConfig = JSON.parse(new TextDecoder().decode(descriptor));
-    const manifest = JSON.parse(new TextDecoder().decode(await decrypt(await fetchBytes(publicConfig.manifest), 'manifest')));
+    const path = manifestPath || JSON.parse(new TextDecoder().decode(await fetchBytes('./link.json'))).manifest;
+    const metadata = await fetchBytes(path, false, async bytes => {
+      if (manifestHash) {
+        const hash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)), n => n.toString(16).padStart(2, '0')).join('');
+        if (hash !== manifestHash) throw new Error('Publication version mismatch');
+      }
+      return bytes;
+    });
+    const manifest = JSON.parse(new TextDecoder().decode(await decrypt(metadata, 'manifest')));
     if (disposed) return;
     if (manifest.protocol !== protocol || manifest.portfolio.pageCount !== 92) throw new Error('Invalid publication');
+    spreads = manifest.portfolio.spreads;
     expiresAt = Date.parse(manifest.config.expiresAt);
     if (!Number.isFinite(expiresAt)) throw new Error('Invalid expiry');
     if (Date.now() >= expiresAt) { locked('作品集已到期', '当前链接已停止显示，请联系作品集所有者。'); return; }
@@ -106,12 +149,12 @@
         const record = manifest.images[id];
         if (!record) return Promise.reject(new Error('Unknown image'));
         const promise = enqueue(async () => {
-          const data = await decrypt(await fetchBytes(record.path, true), id);
+          const data = await fetchBytes(record.path, true, bytes => decrypt(bytes, id));
           if (disposed) throw new Error('Reader closed');
           const url = URL.createObjectURL(new Blob([data], { type: 'image/webp' }));
           blobURLs.add(url);
           return url;
-        });
+        }, id);
         images.set(id, promise);
         promise.catch(() => images.delete(id));
       }
@@ -121,13 +164,42 @@
     function loadImage(img, n, thumb = false) {
       if (disposed) return;
       img.dataset.privatePage = String(n);
-      const load = () => imageBlob(n, thumb).then(url => {
-        if (!disposed && img.isConnected) { img.src = url; img.dataset.loaded = 'true'; }
-      }).catch(() => {
-        if (!disposed) { img.dataset.loadError = 'true'; img.alt = `第 ${n} 页暂未加载，请刷新后重试`; }
-      });
+      img.dataset.privateKind = thumb ? 'thumb' : 'page';
+      const matching = () => document.querySelectorAll(`img[data-private-page="${n}"][data-private-kind="${thumb ? 'thumb' : 'page'}"]`);
+      let attempts = 0;
+      const load = () => {
+        attempts++;
+        for (const target of matching()) {
+          delete target.dataset.loadError;
+          const status = target.parentElement.querySelector('.reader-image-status');
+          if (status) status.textContent = '正在加载…';
+        }
+        return imageBlob(n, thumb).then(url => {
+          if (disposed) return;
+          // PageFlip clones a page during a turn; update that copy as well.
+          for (const target of matching()) {
+            target.src = url; target.dataset.loaded = 'true'; delete target.dataset.loadError;
+            target.alt = `作品集第 ${n} 页`;
+            target.parentElement.querySelector('.reader-image-status')?.remove();
+          }
+        }).catch(() => {
+          if (disposed) return;
+          for (const target of matching()) {
+            target.dataset.loadError = 'true'; target.alt = `第 ${n} 页暂未加载`;
+            const status = target.parentElement.querySelector('.reader-image-status');
+            if (status) status.textContent = attempts < 2 ? '正在重新连接…' : '加载失败，点击重试';
+          }
+          if (attempts < 2) {
+            const timer = setTimeout(() => { retryTimers.delete(timer); if (!disposed && matching().length) load(); }, 1200);
+            retryTimers.add(timer);
+          }
+        });
+      };
       queueMicrotask(() => {
         if (disposed || !img.isConnected) return;
+        if (img.parentElement.classList.contains('book-page') && !img.parentElement.querySelector('.reader-image-status')) {
+          const status = document.createElement('span'); status.className = 'reader-image-status'; status.textContent = '正在加载…'; img.parentElement.append(status);
+        }
         if (img.loading === 'lazy') { pending.set(img, load); lazyObserver.observe(img); }
         else load();
       });
@@ -137,6 +209,13 @@
     for (const script of parsed.querySelectorAll('script')) script.remove();
     document.head.replaceChildren(...Array.from(parsed.head.childNodes, node => document.importNode(node, true)));
     document.body.replaceWith(document.importNode(parsed.body, true));
+    const statusStyle = document.createElement('style');
+    statusStyle.textContent = '.book-page{position:relative}.reader-image-status{position:absolute;inset:0;display:grid;place-items:center;background:#171918;color:#b5b1a7;font:13px/1.6 sans-serif;pointer-events:none}.book-page:has(img[data-load-error]){cursor:pointer}';
+    document.head.append(statusStyle);
+    document.addEventListener('click', event => {
+      const target = event.target.closest('.book-page')?.querySelector('img[data-load-error]');
+      if (target) { event.preventDefault(); event.stopImmediatePropagation(); loadImage(target, Number(target.dataset.privatePage)); }
+    }, true);
     window.PORTFOLIO = manifest.portfolio;
     window.VIEWER_CONFIG = manifest.config;
     window.PRIVATE_READER = { loadImage, dispose };
