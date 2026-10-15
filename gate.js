@@ -6,13 +6,10 @@
   const encoder = new TextEncoder();
   const blobURLs = new Set();
   const images = new Map();
-  const readyImages = new Set();
   const pending = new WeakMap();
   const queue = [];
-  const jobs = new Map();
   const controller = new AbortController();
   let active = 0;
-  let backgroundActive = 0;
   let disposed = false;
   let expiresAt = Infinity;
   let deadlineTimer;
@@ -44,38 +41,22 @@
     clearTimeout(deadlineTimer);
     controller.abort();
     queue.length = 0;
-    jobs.clear();
     lazyObserver.disconnect();
     for (const url of blobURLs) URL.revokeObjectURL(url);
     blobURLs.clear();
     images.clear();
-    readyImages.clear();
   }
 
   function pump() {
-    queue.sort((a, b) => a.priority - b.priority);
     while (!disposed && active < 4 && queue.length) {
-      if (queue[0].priority > 0 && (active > backgroundActive || backgroundActive >= 1)) break;
       const job = queue.shift();
-      const background = job.priority > 0;
       active++;
-      if (background) backgroundActive++;
-      job.run().then(job.resolve, job.reject).finally(() => {
-        jobs.delete(job.id);
-        active--;
-        if (background) backgroundActive--;
-        pump();
-      });
+      job.run().then(job.resolve, job.reject).finally(() => { active--; pump(); });
     }
   }
 
-  function enqueue(id, run, priority) {
-    return new Promise((resolve, reject) => {
-      const job = { id, run, resolve, reject, priority };
-      jobs.set(id, job);
-      queue.push(job);
-      pump();
-    });
+  function enqueue(run) {
+    return new Promise((resolve, reject) => { queue.push({ run, resolve, reject }); pump(); });
   }
 
   const lazyObserver = new IntersectionObserver(entries => {
@@ -119,47 +100,32 @@
     if (!Number.isFinite(expiresAt)) throw new Error('Invalid expiry');
     if (Date.now() >= expiresAt) { locked('作品集已到期', '当前链接已停止显示，请联系作品集所有者。'); return; }
 
-    function imageBlob(n, thumb, background) {
+    function imageBlob(n, thumb) {
       const id = `${thumb ? 'thumb' : 'page'}:${String(n).padStart(3, '0')}`;
-      const priority = background ? 2 : 0;
-      const queued = jobs.get(id);
-      if (queued && priority < queued.priority) { queued.priority = priority; pump(); }
       if (!images.has(id)) {
         const record = manifest.images[id];
         if (!record) return Promise.reject(new Error('Unknown image'));
-        const promise = enqueue(id, async () => {
+        const promise = enqueue(async () => {
           const data = await decrypt(await fetchBytes(record.path, true), id);
           if (disposed) throw new Error('Reader closed');
           const url = URL.createObjectURL(new Blob([data], { type: 'image/webp' }));
           blobURLs.add(url);
-          readyImages.add(id);
           return url;
-        }, priority);
+        });
         images.set(id, promise);
         promise.catch(() => images.delete(id));
       }
       return images.get(id);
     }
 
-    function loadImage(img, n, thumb = false, background = false) {
+    function loadImage(img, n, thumb = false) {
       if (disposed) return;
       img.dataset.privatePage = String(n);
-      const load = () => {
-        const complete = imageBlob(n, thumb, background);
-        const id = `page:${String(n).padStart(3, '0')}`;
-        if (!thumb && !background && n !== 1 && n !== 92 && !readyImages.has(id)) {
-          imageBlob(n, true, false).then(url => {
-            if (!disposed && img.isConnected && img.dataset.loaded !== 'true') {
-              img.src = url; img.dataset.preview = 'true';
-            }
-          }).catch(() => { /* The full-resolution image remains the primary load. */ });
-        }
-        return complete.then(url => {
-          if (!disposed && img.isConnected) { img.src = url; img.dataset.loaded = 'true'; delete img.dataset.preview; }
-        }).catch(() => {
-          if (!disposed) { img.dataset.loadError = 'true'; img.alt = `第 ${n} 页暂未加载，请刷新后重试`; }
-        });
-      };
+      const load = () => imageBlob(n, thumb).then(url => {
+        if (!disposed && img.isConnected) { img.src = url; img.dataset.loaded = 'true'; }
+      }).catch(() => {
+        if (!disposed) { img.dataset.loadError = 'true'; img.alt = `第 ${n} 页暂未加载，请刷新后重试`; }
+      });
       queueMicrotask(() => {
         if (disposed || !img.isConnected) return;
         if (img.loading === 'lazy') { pending.set(img, load); lazyObserver.observe(img); }
