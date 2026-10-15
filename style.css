@@ -11,14 +11,18 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 #fullscreen { width: auto; gap: 7px; padding: 0 10px; font-size: 11px; white-space: nowrap; flex-shrink: 0; }
 #fullscreen svg { flex-shrink: 0; }
 .fullscreen-compact { display: none; }
+@media (min-width: 561px) and (max-width: 850px) {
+  .header-actions { flex: 0 0 auto; }
+}
 body[data-mode="magazine"] {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto minmax(0, 1fr) auto;
   height: 100vh;
   height: 100dvh;
   overflow: hidden;
 }
-body[data-mode="magazine"] #main { min-height: 0; }
+body[data-mode="magazine"] #main { min-height: 0; min-width: 0; }
 body[data-mode="magazine"] #magazine-view { height: 100%; min-height: 0; }
 
 @media (max-width: 560px) {
